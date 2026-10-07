@@ -1,0 +1,14 @@
+server:
+  port: 8080
+spring:
+  application:
+    name: gamehub
+  jackson:
+    deserialization:
+      fail-on-unknown-properties: true
+app:
+  redis:
+    sentinel-uri: "${SENTINEL_URI:redis-sentinel://sentinel-1:26379,sentinel-2:26380,sentinel-3:26381/0#mymaster}"
+logging:
+  level:
+    ru.gamehub: INFO

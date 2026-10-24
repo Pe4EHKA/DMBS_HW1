@@ -1,0 +1,98 @@
+x-node: &node
+  image: redis:7.4.11-alpine
+  entrypoint: [ "sh", "/config/start.sh" ]
+  restart: unless-stopped
+  networks: [ gamehub ]
+  healthcheck:
+    test: [ "CMD-SHELL", "redis-cli -p $$PORT ping | grep -q PONG" ]
+    interval: 2s
+    timeout: 2s
+    retries: 30
+
+x-sentinel: &sentinel
+  <<: *node
+  depends_on:
+    redis-master: { condition: service_healthy }
+    redis-replica-1: { condition: service_healthy }
+    redis-replica-2: { condition: service_healthy }
+
+services:
+  redis-master:
+    <<: *node
+    container_name: redis-master
+    environment: { MODE: redis, NODE: redis-master, PORT: "6379" }
+    ports: [ "127.0.0.1:6379:6379" ]
+    volumes: [ "./infra:/config:ro", "master-data:/data" ]
+  redis-replica-1:
+    <<: *node
+    container_name: redis-replica-1
+    environment: { MODE: redis, NODE: redis-replica-1, PORT: "6380", REPLICA_OF: redis-master }
+    ports: [ "127.0.0.1:6380:6380" ]
+    volumes: [ "./infra:/config:ro", "replica-1-data:/data" ]
+    depends_on:
+      redis-master: { condition: service_healthy }
+  redis-replica-2:
+    <<: *node
+    container_name: redis-replica-2
+    environment: { MODE: redis, NODE: redis-replica-2, PORT: "6381", REPLICA_OF: redis-master }
+    ports: [ "127.0.0.1:6381:6381" ]
+    volumes: [ "./infra:/config:ro", "replica-2-data:/data" ]
+    depends_on:
+      redis-master: { condition: service_healthy }
+  sentinel-1:
+    <<: *sentinel
+    container_name: sentinel-1
+    environment: { MODE: sentinel, NODE: sentinel-1, PORT: "26379" }
+    ports: [ "127.0.0.1:26379:26379" ]
+    volumes: [ "./infra:/config:ro", "sentinel-1-data:/data" ]
+  sentinel-2:
+    <<: *sentinel
+    container_name: sentinel-2
+    environment: { MODE: sentinel, NODE: sentinel-2, PORT: "26380" }
+    ports: [ "127.0.0.1:26380:26380" ]
+    volumes: [ "./infra:/config:ro", "sentinel-2-data:/data" ]
+  sentinel-3:
+    <<: *sentinel
+    container_name: sentinel-3
+    environment: { MODE: sentinel, NODE: sentinel-3, PORT: "26381" }
+    ports: [ "127.0.0.1:26381:26381" ]
+    volumes: [ "./infra:/config:ro", "sentinel-3-data:/data" ]
+  app:
+    build: { context: ., target: runtime }
+    container_name: gamehub-app
+    restart: unless-stopped
+    environment:
+      JAVA_TOOL_OPTIONS: "-Xms128m -Xmx384m -XX:ActiveProcessorCount=2"
+    ports: [ "127.0.0.1:8080:8080" ]
+    networks: [ gamehub ]
+    depends_on:
+      sentinel-1: { condition: service_healthy }
+      sentinel-2: { condition: service_healthy }
+      sentinel-3: { condition: service_healthy }
+    healthcheck:
+      test: [ "CMD-SHELL", "wget -q -O /dev/null http://localhost:8080/api/health || exit 1" ]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+  tests:
+    profiles: [ test ]
+    build: { context: ., target: tests }
+    environment:
+      BASE_URL: "http://app:8080"
+      SENTINEL_URI: "redis-sentinel://sentinel-1:26379,sentinel-2:26380,sentinel-3:26381/0#mymaster"
+      MAVEN_OPTS: "-Xmx512m -XX:ActiveProcessorCount=2"
+    networks: [ gamehub ]
+    depends_on:
+      app: { condition: service_healthy }
+
+networks:
+  gamehub: { driver: bridge }
+
+volumes:
+  master-data:
+  replica-1-data:
+  replica-2-data:
+  sentinel-1-data:
+  sentinel-2-data:
+  sentinel-3-data:

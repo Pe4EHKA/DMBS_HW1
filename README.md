@@ -1,93 +1,118 @@
-# DBMS HW
+# GameHub — домашняя работа Redis
 
+Java 21, Spring Boot 3.5.12, Lettuce, Redis 7.4.11. Redis — единственное хранилище этой учебной системы. HTTP API работает на порту 8080.
 
+## Запуск
 
-## Getting started
+Нужны Docker с Compose V2; для сценариев отказа — Python 3.9+ и Bash. Локальная установка Java/Maven не обязательна: сборка и тесты запускаются в контейнерах. Все команды выполняются из корня DBMS_HW.
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
-
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
-
-## Add your files
-
-* [Create](https://docs.gitlab.com/user/project/repository/web_editor/#create-a-file) or [upload](https://docs.gitlab.com/user/project/repository/web_editor/#upload-a-file) files
-* [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
-
-```
-cd existing_repo
-git remote add origin https://git.culab.ru/v.baturin/DBMS_HW.git
-git branch -M main
-git push -uf origin main
+```bash
+docker compose config
+docker compose up -d --build
+docker compose ps
+curl -f http://localhost:8080/api/health
+bash scripts/redis.sh INFO replication
 ```
 
-## Integrate with your tools
+Дождитесь `healthy` у приложения. Начальная загрузка Maven-зависимостей требует интернета. В `INFO replication` ожидаются `role:master` и `connected_slaves:2`.
 
-* [Set up project integrations](https://git.culab.ru/v.baturin/DBMS_HW/-/settings/integrations)
+```bash
+docker compose logs -f app
+```
 
-## Collaborate with your team
+Остановка без удаления данных: `docker compose down`. Следующий запуск: `docker compose up -d`.
+**Полное удаление всех учебных данных:** `docker compose down -v`. Эта команда также сбрасывает сохранённую топологию.
 
-* [Invite team members and collaborators](https://docs.gitlab.com/user/project/members/)
-* [Create a new merge request](https://docs.gitlab.com/user/project/merge_requests/creating_merge_requests/)
-* [Automatically close issues from merge requests](https://docs.gitlab.com/user/project/issues/managing_issues/#closing-issues-automatically)
-* [Enable merge request approvals](https://docs.gitlab.com/user/project/merge_requests/approvals/)
-* [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+## Архитектура
 
-## Test and Deploy
+```text
+HTTP -> Spring MVC -> GameService -> Lettuce -> Redis master
+                                      |            |
+                                      |            +-> replica 1
+                                      |            +-> replica 2
+                                      +-> 3 Sentinel: discovery + topology events
+                                      +-> replica-preferred reads
+NotificationWorker -> XREADGROUP -> log -> XACK
+```
 
-Use the built-in continuous integration in GitLab.
+Sentinel не проксирует команды: Lettuce узнаёт адреса и соединяется с узлами Redis. Все компоненты находятся в сети Compose. Внутренние и внешние порты совпадают: 6379/6380/6381 и 26379/26380/26381. На хосте порты опубликованы только на 127.0.0.1. Запускайте приложение и тесты в Docker: внутренние DNS-имена Sentinel/Redis обычно недоступны из JVM на хосте.
 
-* [Get started with GitLab CI/CD](https://docs.gitlab.com/ci/quick_start/)
-* [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/user/application_security/sast/)
-* [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/topics/autodevops/requirements/)
-* [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/user/clusters/agent/)
-* [Set up protected environments](https://docs.gitlab.com/ci/environments/protected_environments/)
+Конфигурации всех узлов включают AOF `everysec`, RDB, `volatile-lru`, `min-replicas-to-write 1`, `min-replicas-max-lag 10`. Поэтому настройки сохраняются при повышении реплики до мастера. Рабочие redis.conf/sentinel.conf хранятся в named volumes и допускают CONFIG REWRITE. Шаблоны из infra копируются только при первом старте; их изменение не перезаписывает существующую рабочую конфигурацию.
 
-***
+## Данные
 
-# Editing this README
+| Ключ | Тип | Время жизни |
+|---|---|---|
+| `player:{id}` | Hash: name, level, region, created_at | Без TTL |
+| `logins:{id}` | String, целое число | 86400 секунд с первого входа |
+| `cache:player:{id}` | String, JSON профиля | 60 секунд |
+| `tournament:main` | Sorted Set: playerId -> score | Без TTL |
+| `achievements:{id}` | Set | Без TTL |
+| `notifications` | Stream | Удаление записей старше 7 дней |
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+`created_at` сохраняется при обновлениях. GET профиля читает кеш и исходный Hash на мастере. WATCH запрещает заполнить кеш старым профилем после конкурентного изменения. Обновление профиля/уровня, инвалидация и XADD выполняются через MULTI/EXEC.
 
-## Suggestions for a good README
+Лидерборд и достижения по умолчанию читаются с реплик. Для чтения с мастера добавьте `?consistent=true` (при других параметрах — `&consistent=true`). Асинхронная репликация допускает кратковременное отставание.
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+## API
 
-## Name
-Choose a self-explaining name for your project.
+| Метод и путь | Тело / результат |
+|---|---|
+| `POST /api/players/{id}` | `{"name":"Alice","level":1,"region":"EU"}` |
+| `GET /api/players/{id}` | Профиль, заголовок X-Cache: MISS/HIT |
+| `PATCH /api/players/{id}/level` | `{"delta":2}` |
+| `POST /api/players/{id}/login` | Возвращает count и ttl |
+| `POST /api/leaderboard/score` | `{"playerId":"p1","score":100}` — прибавить очки |
+| `GET /api/leaderboard/top?limit=10` | По убыванию очков |
+| `GET /api/leaderboard/rank/{playerId}` | rank и position |
+| `POST /api/players/{id}/achievements` | `{"name":"winner"}` |
+| `GET /api/players/{id}/achievements/{name}` | exists |
+| `GET /api/players/{id1}/achievements/common/{id2}` | Общие достижения |
+| `POST /api/players/batch` | `{"players":[{"id":"p1","profile":{"name":"A","level":1,"region":"EU"}}]}` |
+| `GET /api/health` | PING и короткоживущая пробная запись |
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+`rank` — результат ZRANK: индекс с нуля по возрастанию очков, как в условии. `position` — ZREVRANK + 1: место с единицы по убыванию. При одинаковых очках Redis упорядочивает участников по строковому ID; отдельного правила одинаковых мест нет.
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+Ошибки: 400 — неверный запрос, 404 — отсутствующий профиль/участник рейтинга, 409 — частые конкурентные изменения, 503 — ошибка Redis. ID состоит из букв ASCII, цифр, `_`, `-`, длина 1–64. Уровень: 0–1000000. В batch разрешены 1–1000 разных ID.
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+## Streams и pipeline
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+Группа `notifications-group` создаётся через XGROUP CREATE с `$` и MKSTREAM до готовности HTTP API. Единственный consumer `gamehub-consumer` сначала читает свои pending-сообщения с `0`, затем новые с `>`. После логирования выполняется XACK; после сбоя между логом и ACK возможен повтор. При восстановлении отсутствующей группы используется `0-0`, чтобы не пропустить уже существующие записи.
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+Каждые 60 секунд XTRIM MINID удаляет записи старше семи дней. TTL всего ключа не используется. Фактическая очистка выполняется на ближайшем проходе работающего worker. MAXLEN не заменяет ограничение по времени. Pending-ссылки на уже удалённые записи подтверждаются при чтении pending.
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+Batch использует выделенное Lettuce-соединение, async API, `setAutoFlushCommands(false)` и `flushCommands()`. Ответы ожидаются после отправки всей пачки. Каждый профиль импортируется отдельной транзакцией, но вся пачка не является одной атомарной операцией. Ответ содержит count и elapsedMs; время включает открытие выделенного соединения.
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+## Тесты
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+```bash
+docker compose --profile test build tests
+docker compose --profile test run --rm tests
+python3 scripts/ha_demo.py split-brain
+python3 scripts/ha_demo.py failover
+python3 scripts/ha_demo.py persistence
+```
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
+JUnit проверяет профили, MISS/HIT/TTL, инвалидацию, конкурентные входы и изменения уровня, лидерборд, достижения, batch из 20 профилей, доставку/ACK, семидневную очистку и валидацию. Тесты используют настоящий API и Redis, удаляют только свои профили/рейтинги/счётчики; тестовые уведомления остаются до очистки.
 
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
+Сценарии HA находят текущего мастера через Sentinel, поэтому работают и после предыдущего failover. Они останавливают/приостанавливают узлы только этого учебного стенда и затем восстанавливают их. Не запускайте JUnit и сценарии отказа одновременно. Проверка persistence подтверждает штатный перезапуск с volumes, а не отсутствие потерь при внезапном отключении питания.
 
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+Преподавательский `dz1_check.py` не входил в исходный проект. После получения запустите его отдельно по инструкции курса; наши проверки его не подменяют.
 
-## License
-For open source projects, say how it is licensed.
+## Видео 5–10 минут
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+0:00–1:00 — запуск, ps, INFO replication, три Sentinel.
+1:00–3:00 — создание/обновление профилей, лидерборд, достижения и пересечение.
+3:00–4:00 — два GET, X-Cache, TTL, PATCH и инвалидация.
+4:00–5:00 — XRANGE, XINFO GROUPS, XPENDING и логи NOTIFICATION/ACK.
+5:00–6:00 — batch 20 профилей, elapsedMs, HGETALL импортированного профиля.
+6:00–7:30 — failover, смена адреса мастера, успешная запись без рестарта приложения.
+7:30–9:00 — пауза обеих текущих реплик, NOREPLICAS, восстановление.
+
+## Ограничения
+
+Это локальная учебная система без аутентификации/TLS. Не публикуйте её порты в интернет. Три Sentinel на одном компьютере не защищают от отказа самого компьютера. Репликация асинхронна: Sentinel и min-replicas ограничивают риск, но не обеспечивают нулевую потерю записей. AOF everysec также допускает потерю последних записей при аварии.
+
+Lua используется только для INCR + EXPIRE. Окно входов начинается с первого входа, а не с календарной полуночи. volatile-lru может вытеснить не только кеш, но и счётчик с TTL при нехватке памяти. Ключи без TTL не вытесняются этой политикой; при их росте возможен OOM.
+
+MULTI/EXEC предотвращает чередование команд с другими клиентами, но не откатывает уже выполненные команды при ошибке отдельной команды. Повторять операции инкремента после сетевого таймаута автоматически нельзя: результат может быть неизвестен. Lettuce переподключается и отслеживает топологию; гарантии exactly-once здесь нет.
